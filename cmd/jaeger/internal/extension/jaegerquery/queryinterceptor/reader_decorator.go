@@ -19,9 +19,10 @@ import (
 // it cannot match data the caller may not read, and the public Query has no field for the
 // filter, so the interceptor can neither see the predicate nor constrain it — and cannot tell
 // that it failed to. Refusing the search is the only answer that does not quietly under-gate
-// it. It reaches this point only from a remote backend that declares FilterCapabilities,
-// because for every other reader the query service rewrites the filter into the fields the
-// public Query does carry.
+// it. It reaches this point from any reader that declares FilterCapabilities — today
+// Elasticsearch/OpenSearch and a remote backend that declares them — because for a reader
+// that declares none the query service rewrites the filter into the fields the public Query
+// does carry.
 //
 // Lifting this means giving the public Query the filter, which waits on the filter AST
 // settling: it would be a stable extension contract over a shape RFC 0005 is still moving.

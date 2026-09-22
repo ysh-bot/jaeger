@@ -17,9 +17,9 @@ import (
 // nativeTraceSummariesGate records that trace summaries (the metadata shown on
 // the search-results page) are computed natively in Elasticsearch/OpenSearch via
 // a single aggregation query, instead of loading full traces and aggregating them
-// in the query service. The gate is Stable and can no longer be disabled; it stays
-// registered only so existing --feature-gates values keep working until it is
-// removed in v2.24.0.
+// in the query service. The gate is Stable: enabling it in --feature-gates stays
+// accepted until the ID is removed in v2.24.0, while disabling it is a startup
+// error.
 var nativeTraceSummariesGate = featuregate.GlobalRegistry().MustRegister(
 	"jaeger.es.nativeTraceSummaries",
 	featuregate.StageStable,
@@ -30,6 +30,7 @@ var nativeTraceSummariesGate = featuregate.GlobalRegistry().MustRegister(
 			"via aggregations when the cluster allows inline (Painless) scripts, falling back "+
 			"to the query service otherwise. Retained for backward compatibility and removed in v2.24.0.",
 	),
+	featuregate.WithRegisterReferenceURL("https://github.com/jaegertracing/jaeger/issues/9057"),
 )
 
 // FindTraceSummaries computes trace summaries via a storage-side aggregation. When

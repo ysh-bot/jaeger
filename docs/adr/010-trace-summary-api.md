@@ -34,7 +34,7 @@ Callers therefore see one behavior regardless of backend: the endpoint always wo
 
 ### Native support, and who has it
 
-Elasticsearch/OpenSearch computes summaries in a single storage-side aggregation, requiring inline Painless scripts on the cluster. The `jaeger.es.nativeTraceSummaries` feature gate that introduced it (Beta since v2.20.0) is Stable as of v2.22.0 and can no longer be disabled; the gate ID is removed in v2.24.0. When the cluster rejects scripting, the reader yields `errors.ErrUnsupported` and the query service falls back transparently.
+Elasticsearch/OpenSearch computes summaries in a single storage-side aggregation that uses inline Painless scripts. The `jaeger.es.nativeTraceSummaries` feature gate that introduced it (Beta since v2.20.0) is Stable as of v2.22.0 and can no longer be disabled; the gate ID is removed in v2.24.0. When the cluster rejects scripting, the reader yields `errors.ErrUnsupported` and the query service falls back transparently.
 
 The remote storage gRPC adapter forwards the RPC and translates `codes.Unimplemented` into `errors.ErrUnsupported`. For server-streaming RPCs the server's status arrives on the first `Recv()` rather than at stream open, which the client iterator handles.
 

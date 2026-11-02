@@ -206,7 +206,7 @@ func toolResultMessageID(toolCallID acp.ToolCallId) string {
 // Unprefixed names (telemetry tools) are returned unchanged.
 //
 // A name that is exactly UIToolPrefix would strip to "", which AG-UI tool-call
-// events reject and which would break SSE encoding. The AG-UI run
+// events reject and which would break SSE encoding. The ACP client
 // receives agent notifications directly, so it falls back to the original
 // (still non-empty) name rather than terminating the run over a malformed
 // upstream tool name.

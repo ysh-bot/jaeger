@@ -5,7 +5,6 @@ package jaegerai
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -16,18 +15,15 @@ import (
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	aguisse "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	"github.com/coder/acp-go-sdk"
-	"go.uber.org/zap"
 )
 
 // aguiRunIDSeq is the process-wide monotonic counter that newIDStem
 // appends to its time-derived stem.
 var aguiRunIDSeq atomic.Uint64
 
-var _ acp.Client = (*aguiRun)(nil)
-
-// aguiRun is the server side of one AG-UI run for one chat turn. It implements
-// acp.Client so the ACP SDK delivers the agent's session updates to it, and it
-// translates each update into an AG-UI SSE event written to the HTTP response.
+// aguiRun is the server side of one AG-UI run for one chat turn. It writes the
+// run's events as AG-UI SSE frames into the HTTP response; acpClient feeds it
+// the agent's output and the turn-scoped MCP endpoint feeds it UI tool calls.
 //
 // Events are constructed via the typed AG-UI SDK constructors so that
 // schema-required fields (toolCallName, messageId, etc.) are positional —
@@ -35,9 +31,9 @@ var _ acp.Client = (*aguiRun)(nil)
 // frontend. Framing is delegated to the SDK's SSEWriter.
 //
 // All mutable fields (closed, threadID, runID, messageID, textOpen) are
-// guarded by mu. The ACP SDK may invoke SessionUpdate on a goroutine other
+// guarded by mu. acpClient feeds agent output on a goroutine other
 // than the one driving Prompt, and lifecycle calls (startRun, finishRun,
-// failRun) come from the chat handler — every entry point that touches
+// failRun) come from the chat handler, so every entry point that touches
 // state or writes a frame must acquire the lock first.
 type aguiRun struct {
 	requestCtx context.Context
@@ -147,7 +143,7 @@ func (c *aguiRun) failRun(message string) {
 // ensureTextStart emits TEXT_MESSAGE_START when streamed assistant text is
 // observed and no message is open. Subsequent chunks are emitted as
 // TEXT_MESSAGE_CONTENT. A messageID is allocated lazily here as well as in
-// startRun so an out-of-order SessionUpdate (no preceding startRun) still
+// startRun so an out-of-order text chunk (no preceding startRun) still
 // produces a schema-valid event — the SDK rejects events with empty required
 // fields at encode time. Must be called with c.mu held.
 func (c *aguiRun) ensureTextStart() {
@@ -176,11 +172,59 @@ func (c *aguiRun) closeText() {
 	c.messageID = ""
 }
 
+// appendText streams one chunk of assistant text as TEXT_MESSAGE_CONTENT,
+// opening a text message first when none is open. The AG-UI SDK rejects an
+// empty delta and closes the stream, so an empty chunk is dropped. Whitespace
+// between tokens is a real delta and is kept, but whitespace before the first
+// visible text must not open a message.
+func (c *aguiRun) appendText(text string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if text == "" || (!c.textOpen && strings.TrimSpace(text) == "") {
+		return
+	}
+	c.ensureTextStart()
+	c.emit(aguievents.NewTextMessageContentEvent(c.messageID, text))
+}
+
+// startToolCall closes any open text message and emits TOOL_CALL_START for a
+// tool the agent invoked, followed by TOOL_CALL_ARGS when rawInput is known.
+func (c *aguiRun) startToolCall(toolCallID, toolName string, rawInput any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeText()
+	c.emit(aguievents.NewToolCallStartEvent(toolCallID, toolName))
+	if rawInput != nil {
+		c.emit(aguievents.NewToolCallArgsEvent(toolCallID, marshalToolArgsDelta(rawInput)))
+	}
+}
+
+// updateToolCall emits the later events of a tool call: TOOL_CALL_ARGS when
+// rawInput is present, TOOL_CALL_RESULT when rawOutput is present, and
+// TOOL_CALL_END when the call has finished.
+func (c *aguiRun) updateToolCall(toolCallID string, rawInput, rawOutput any, finished bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rawInput != nil {
+		c.emit(aguievents.NewToolCallArgsEvent(toolCallID, marshalToolArgsDelta(rawInput)))
+	}
+	if rawOutput != nil {
+		c.emit(aguievents.NewToolCallResultEvent(
+			toolResultMessageID(acp.ToolCallId(toolCallID)),
+			toolCallID,
+			flattenToolResultContent(rawOutput),
+		))
+	}
+	if finished {
+		c.emit(aguievents.NewToolCallEndEvent(toolCallID))
+	}
+}
+
 // EmitUIToolCall fires the TOOL_CALL_START / TOOL_CALL_ARGS /
 // TOOL_CALL_END lifecycle for a UI tool the agent invoked via the
 // turn-scoped MCP endpoint, writing the events onto the browser SSE stream so
 // the frontend executes the tool. It acquires c.mu like the other entry points,
-// so it is safe to call concurrently with the ACP SessionUpdate path.
+// so it is safe to call concurrently with the acpClient path.
 func (c *aguiRun) EmitUIToolCall(toolCallID, toolName string, rawArgs any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -190,157 +234,4 @@ func (c *aguiRun) EmitUIToolCall(toolCallID, toolName string, rawArgs any) {
 		c.emit(aguievents.NewToolCallArgsEvent(toolCallID, marshalToolArgsDelta(rawArgs)))
 	}
 	c.emit(aguievents.NewToolCallEndEvent(toolCallID))
-}
-
-// RequestPermission auto-accepts tool calls by selecting the first
-// allow-flavoured option the agent offers. The gateway curates which tools
-// an agent can invoke through two pre-approved channels:
-//   - MCP tools the operator wires up at deploy time (read-only telemetry
-//     queries against Jaeger).
-//   - UI tools the frontend declares for the chat turn (browser-
-//     side AG-UI tools the user is implicitly authorising by sending the
-//     prompt).
-//
-// Filesystem and terminal capabilities are disabled in Initialize, so a
-// well-behaved agent will not have other tools to ask about; if one does
-// ask, we still accept because the tool itself was already curated upstream.
-// AG-UI has no permission-request event shape to bubble a per-call prompt
-// up to the browser, so deferring would be useless.
-//
-// The previous "always cancel" policy was incompatible with agents like the
-// Claude Agent SDK, which routes every tool call through canUseTool / a
-// session/request_permission RPC; the cancelled outcome aborted every call
-// as "Tool use aborted". The Gemini sidecar never hit this because Gemini's
-// tool path does not issue ACP permission requests.
-//
-// If the agent presents no allow-kind option (e.g. only reject choices),
-// we fall through to cancelled so a misconfigured agent cannot be coerced
-// into a forbidden action.
-func (*aguiRun) RequestPermission(_ context.Context, req acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	for _, opt := range req.Options {
-		if opt.Kind == acp.PermissionOptionKindAllowOnce || opt.Kind == acp.PermissionOptionKindAllowAlways {
-			return acp.RequestPermissionResponse{
-				Outcome: acp.RequestPermissionOutcome{
-					Selected: &acp.RequestPermissionOutcomeSelected{OptionId: opt.OptionId},
-				},
-			}, nil
-		}
-	}
-	return acp.RequestPermissionResponse{
-		Outcome: acp.RequestPermissionOutcome{
-			Cancelled: &acp.RequestPermissionOutcomeCancelled{},
-		},
-	}, nil
-}
-
-func (c *aguiRun) SessionUpdate(_ context.Context, n acp.SessionNotification) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	u := n.Update
-	if u.AgentMessageChunk != nil && u.AgentMessageChunk.Content.Text != nil {
-		text := u.AgentMessageChunk.Content.Text.Text
-		// The AG-UI SDK rejects an empty delta and closes the stream.
-		// Whitespace between tokens and paragraphs is a real delta and is kept.
-		// Whitespace before the first visible text must not open a message.
-		if text != "" && (c.textOpen || strings.TrimSpace(text) != "") {
-			c.ensureTextStart()
-			c.emit(aguievents.NewTextMessageContentEvent(c.messageID, text))
-		}
-	}
-	if u.ToolCall != nil {
-		c.closeText()
-		// The agent populates ACP Title with the tool name it was offered, which
-		// for a UI tool carries UIToolPrefix. Strip it so the frontend sees the
-		// name it registered.
-		c.emit(aguievents.NewToolCallStartEvent(
-			string(u.ToolCall.ToolCallId),
-			stripUIToolPrefix(u.ToolCall.Title),
-		))
-		if u.ToolCall.RawInput != nil {
-			c.emit(aguievents.NewToolCallArgsEvent(
-				string(u.ToolCall.ToolCallId),
-				marshalToolArgsDelta(u.ToolCall.RawInput),
-			))
-		}
-	}
-	if u.ToolCallUpdate != nil {
-		if u.ToolCallUpdate.RawInput != nil {
-			c.emit(aguievents.NewToolCallArgsEvent(
-				string(u.ToolCallUpdate.ToolCallId),
-				marshalToolArgsDelta(u.ToolCallUpdate.RawInput),
-			))
-		}
-		if u.ToolCallUpdate.RawOutput != nil {
-			c.emit(aguievents.NewToolCallResultEvent(
-				toolResultMessageID(u.ToolCallUpdate.ToolCallId),
-				string(u.ToolCallUpdate.ToolCallId),
-				flattenToolResultContent(u.ToolCallUpdate.RawOutput),
-			))
-		}
-		status := valueOrUnknown(u.ToolCallUpdate.Status)
-		if status == string(acp.ToolCallStatusCompleted) || status == string(acp.ToolCallStatusFailed) {
-			c.emit(aguievents.NewToolCallEndEvent(string(u.ToolCallUpdate.ToolCallId)))
-		}
-	}
-	return nil
-}
-
-// The methods below implement acp.Client operations that the Jaeger gateway
-// does not support (filesystem and terminal). They return errors because the
-// client advertises these capabilities as disabled during Initialize.
-
-var errNotSupported = errors.New("operation not supported by jaeger-ai-gateway")
-
-func (*aguiRun) WriteTextFile(context.Context, acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
-	return acp.WriteTextFileResponse{}, errNotSupported
-}
-
-func (*aguiRun) ReadTextFile(context.Context, acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
-	return acp.ReadTextFileResponse{}, errNotSupported
-}
-
-func (*aguiRun) CreateTerminal(context.Context, acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
-	return acp.CreateTerminalResponse{}, errNotSupported
-}
-
-func (*aguiRun) KillTerminal(context.Context, acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
-	return acp.KillTerminalResponse{}, errNotSupported
-}
-
-func (*aguiRun) ReleaseTerminal(context.Context, acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
-	return acp.ReleaseTerminalResponse{}, errNotSupported
-}
-
-func (*aguiRun) TerminalOutput(context.Context, acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
-	return acp.TerminalOutputResponse{}, errNotSupported
-}
-
-func (*aguiRun) WaitForTerminalExit(context.Context, acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
-	return acp.WaitForTerminalExitResponse{}, errNotSupported
-}
-
-// closeACPSession is a best-effort cleanup hook: it tells the agent to
-// release the session before the gateway tears down the WebSocket. Meant
-// to be invoked via `defer` in ServeHTTP, after defer adapter.Close so it
-// fires first (LIFO) while the connection is still open.
-//
-// The capability gate ensures we never call session/close against agents
-// that don't advertise support — they would respond with MethodNotFound.
-// WithoutCancel detaches the request context's cancellation so cleanup
-// still runs after the client disconnects mid-stream, while preserving
-// values such as tracing. The 5s deadline keeps a stuck agent from
-// hanging the goroutine indefinitely. Errors are Debug-logged because the
-// HTTP response has already been streamed by the time this runs.
-func closeACPSession(ctx context.Context, conn *acp.ClientSideConnection, caps acp.AgentCapabilities, sessionID acp.SessionId, logger *zap.Logger) {
-	if caps.SessionCapabilities.Close == nil {
-		return
-	}
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	_, err := conn.CloseSession(closeCtx, acp.CloseSessionRequest{
-		SessionId: sessionID,
-	})
-	if err != nil {
-		logger.Debug("session/close failed", zap.String("session_id", string(sessionID)), zap.Error(err))
-	}
 }

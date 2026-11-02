@@ -20,7 +20,7 @@ type turnState struct {
 }
 
 // turnRegistry maps a per-turn route id (mcpRouteID) to its turn state. The chat
-// handler mints a route id when it opens a turn, registers the stream and the
+// handler mints a route id when it opens a turn, registers the run and the
 // turn's UI tools here, and removes the entry when the turn ends. The turn-scoped
 // MCP endpoint (`/api/ai/mcp/<mcpRouteID>/`) looks the id up to confirm it belongs
 // to an active turn and to build that turn's tool set.

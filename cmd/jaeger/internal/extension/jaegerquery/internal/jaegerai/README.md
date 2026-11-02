@@ -17,12 +17,14 @@ flowchart TB
 
     subgraph jaeger["Jaeger Query"]
         CHAT["POST /api/ai/chat<br>chatEndpoint"]
-        SC["aguiRun<br>(ACP notifications → AG-UI SSE)"]
+        ACPC["acpClient<br>(ACP callbacks)"]
+        SC["aguiRun<br>(AG-UI SSE events)"]
         WS["WsReadWriteCloser<br>(WebSocket adapter)"]
         TURNS["turnRegistry<br>(per-turn UI tools + SSE stream)"]
         MCP["/api/ai/mcp/&lt;route-id&gt;/<br>turn-scoped MCP endpoint"]
         SHARED["/api/ai/mcp/<br>shared MCP endpoint"]
-        CHAT --> SC
+        CHAT --> ACPC
+        ACPC --> SC
         CHAT --> WS
         CHAT -- "register turn" --> TURNS
         MCP -- "resolve turn" --> TURNS
@@ -57,14 +59,31 @@ back to the browser. It passes the request's `threadId` and `runId` to the
 
 ### aguiRun (`agui_run.go`)
 
-`aguiRun` is the server side of one AG-UI run for one chat turn. It implements
-the ACP `Client` interface so the agent's session updates reach it, and it writes
-them as AG-UI SSE frames into the HTTP response.
+`aguiRun` is the server side of one AG-UI run for one chat turn. It writes the
+run's events as AG-UI SSE frames into the HTTP response. `acpClient` feeds it
+the agent's output and the turn-scoped MCP endpoint feeds it UI tool calls.
 
 - **Run lifecycle.** `startRun`, `finishRun`, and `failRun` emit `RUN_STARTED`,
   `RUN_FINISHED`, and `RUN_ERROR`. Assistant text is bracketed with
   `TEXT_MESSAGE_START` and `TEXT_MESSAGE_END`; a tool call closes the open
   text message, and text after it starts a new message with a new id.
+- **Agent output.** `appendText`, `startToolCall`, and `updateToolCall` emit
+  `TEXT_MESSAGE_CONTENT`, `TOOL_CALL_START`, `TOOL_CALL_ARGS`,
+  `TOOL_CALL_RESULT`, and `TOOL_CALL_END` for what the agent says and does.
+- **`EmitUIToolCall`.** Called from the MCP endpoint when the agent invokes a UI
+  tool. Emits `TOOL_CALL_START`, `TOOL_CALL_ARGS`, and `TOOL_CALL_END` under the
+  bare name the browser registered.
+
+A mutex guards its mutable state because agent output arrives from a different
+goroutine than the one driving `Prompt`, while lifecycle calls come from the
+chat endpoint and UI tool calls from the MCP endpoint.
+
+### acpClient (`acp_client.go`)
+
+`acpClient` implements the ACP `Client` interface for one chat turn. The ACP
+SDK calls it with the agent's notifications and requests, and it drives the
+turn's `aguiRun`.
+
 - **`SessionUpdate`.** Maps ACP `session/update` notifications to AG-UI events:
   `AgentMessageChunk` to `TEXT_MESSAGE_CONTENT`; `ToolCall` to
   `TOOL_CALL_START`, plus `TOOL_CALL_ARGS` when `RawInput` is set;
@@ -74,17 +93,12 @@ them as AG-UI SSE frames into the HTTP response.
   tool calls themselves travel over MCP (below), not over ACP. The tool name in
   a notification is the name the agent was offered, so a UI tool arrives with
   `UIToolPrefix`, which is stripped before the event reaches the browser.
-- **`EmitUIToolCall`.** Called from the MCP endpoint when the agent invokes a UI
-  tool. Emits `TOOL_CALL_START`, `TOOL_CALL_ARGS`, and `TOOL_CALL_END` under the
-  bare name the browser registered.
 - **`RequestPermission`.** Answers `session/request_permission` by selecting the
   first option of kind `allow_once` or `allow_always`, and cancels if the agent
   offers neither. The gateway advertises no filesystem or terminal capability in
   `Initialize`, so a well-behaved agent has nothing else to ask about.
-
-A mutex guards its mutable state because ACP updates may arrive from a
-different goroutine than the one driving `Prompt`, while lifecycle calls come
-from the chat endpoint and UI tool calls from the MCP endpoint.
+- **Filesystem and terminal operations** return an error, because the gateway
+  advertises those capabilities as disabled.
 
 ### WsReadWriteCloser (`ws_adapter.go`)
 
@@ -99,13 +113,14 @@ sends SDK writes as WebSocket text messages.
 sequenceDiagram
     participant UI as Jaeger UI
     participant CHAT as chatEndpoint
+    participant ACPC as acpClient
     participant SC as aguiRun
     participant TURNS as turnRegistry
     participant AGENT as ACP agent
     participant MCP as turn-scoped MCP endpoint
 
     UI->>CHAT: POST /api/ai/chat (RunAgentInput)
-    CHAT->>TURNS: register(stream, UI tools) → route id
+    CHAT->>TURNS: register(run, UI tools) → route id
     CHAT->>AGENT: WS connect, Initialize
     AGENT-->>CHAT: InitializeResponse (mcpCapabilities.http)
     CHAT->>AGENT: NewSession {mcpServers: [turn-scoped URL]}
@@ -129,7 +144,8 @@ sequenceDiagram
         end
     and Progress over ACP
         AGENT->>CHAT: session/update (text chunks, tool_call, tool_call_update)
-        CHAT->>SC: SessionUpdate (strip ui__ from tool names)
+        AGENT-->>ACPC: session/update
+        ACPC->>SC: appendText / startToolCall / updateToolCall (strip ui__)
         SC-->>UI: TEXT_MESSAGE_*, TOOL_CALL_*
     end
 

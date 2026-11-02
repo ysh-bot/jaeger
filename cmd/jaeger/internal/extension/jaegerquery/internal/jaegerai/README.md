@@ -17,7 +17,7 @@ flowchart TB
 
     subgraph jaeger["Jaeger Query"]
         CHAT["POST /api/ai/chat<br>chatEndpoint"]
-        SC["streamingClient<br>(ACP notifications → AG-UI SSE)"]
+        SC["aguiRun<br>(ACP notifications → AG-UI SSE)"]
         WS["WsReadWriteCloser<br>(WebSocket adapter)"]
         TURNS["turnRegistry<br>(per-turn UI tools + SSE stream)"]
         MCP["/api/ai/mcp/&lt;route-id&gt;/<br>turn-scoped MCP endpoint"]
@@ -53,12 +53,13 @@ The chat endpoint is registered at `POST /api/ai/chat` only when
 (`messages`, `tools`, `context`, `threadId`, `runId`), establishes the ACP
 WebSocket connection, runs the ACP session lifecycle, and streams AG-UI events
 back to the browser. It passes the request's `threadId` and `runId` to the
-`streamingClient` so the SSE events match what the AG-UI client expects.
+`aguiRun` so the SSE events match what the AG-UI client expects.
 
-### streamingClient (`streaming_client.go`)
+### aguiRun (`agui_run.go`)
 
-`streamingClient` implements the ACP `Client` interface for one chat turn and
-writes AG-UI SSE frames into the HTTP response.
+`aguiRun` is the server side of one AG-UI run for one chat turn. It implements
+the ACP `Client` interface so the agent's session updates reach it, and it writes
+them as AG-UI SSE frames into the HTTP response.
 
 - **Run lifecycle.** `startRun`, `finishRun`, and `failRun` emit `RUN_STARTED`,
   `RUN_FINISHED`, and `RUN_ERROR`. Assistant text is bracketed with
@@ -98,7 +99,7 @@ sends SDK writes as WebSocket text messages.
 sequenceDiagram
     participant UI as Jaeger UI
     participant CHAT as chatEndpoint
-    participant SC as streamingClient
+    participant SC as aguiRun
     participant TURNS as turnRegistry
     participant AGENT as ACP agent
     participant MCP as turn-scoped MCP endpoint
@@ -220,7 +221,7 @@ should configure it explicitly.
 - `endpoint_turn_mcp.go` and `turn_registry.go` provide the per-turn MCP
   route and lifecycle.
 - `mcp_ui_tools.go` exposes browser UI tools through MCP under `UIToolPrefix`.
-- `streaming_client.go` translates ACP notifications into AG-UI SSE events.
+- `agui_run.go` translates ACP notifications into AG-UI SSE events.
 - `translation.go` holds the AG-UI to ACP helpers, including the prefix strip.
 - `ws_adapter.go` adapts the ACP WebSocket transport.
 - `../mcptools` serves the shared MCP endpoint and the telemetry tools.

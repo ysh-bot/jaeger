@@ -26,6 +26,14 @@ inputs:
     description: 'Reconcile the one-active-PR-per-linked-issue policy across open PRs.'
     required: false
     default: 'false'
+  pull-request-number:
+    description: >-
+      Pull request whose event asked for the run. Its comments, and those of pull
+      requests that share a linked issue with it, are reconciled in addition to
+      those of every duplicate. Defaults to the pull request that triggered the
+      workflow, so only a workflow that runs on another event needs to set this.
+    required: false
+    default: ''
   issue-number:
     description: 'Issue number whose linked PRs should be reconciled.'
     required: false
@@ -46,7 +54,7 @@ runs:
         QUOTA_USERNAME: ${{ inputs.username }}
         QUOTA_DRY_RUN: ${{ inputs.dry-run }}
         QUOTA_PER_ISSUE_LIMIT: ${{ inputs.per-issue-limit }}
-        QUOTA_PR_NUMBER: ${{ github.event.pull_request.number }}
+        QUOTA_PR_NUMBER: ${{ inputs.pull-request-number || github.event.pull_request.number }}
         QUOTA_ISSUE_NUMBER: ${{ inputs.issue-number }}
       with:
         github-token: ${{ inputs.token }}

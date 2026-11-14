@@ -24,6 +24,7 @@ steps:
 | `username` | no | PR author | Whose quota to process. Only manual runs need to set it. |
 | `dry-run` | no | `false` | Log the intended labels and comments without writing anything. |
 | `per-issue-limit` | no | `false` | Reconcile the complete open-PR graph so each linked same-repository issue has one active PR. |
+| `pull-request-number` | no | triggering PR | The PR whose event asked for the run. Its comments, and those of PRs that share a linked issue with it, are reconciled in addition to those of every duplicate. Only a workflow that runs on another event needs to set it. |
 | `issue-number` | no | — | For an issue-label event, limit comment reconciliation to PRs linked to this issue. |
 
 Labels and comments on a pull request go through the `/issues/{n}/labels` and `/issues/{n}/comments` endpoints, so the token needs `issues: write` — `pull-requests: write` alone is not enough, and a token missing it fails every write with `403 Resource not accessible`.
@@ -241,6 +242,17 @@ manual workflow dispatch. Manual runs pass `username`, and optionally `dryRun`.
 policy on pull request lifecycle events, the `allow-multiple-prs` issue-label
 override, and a daily sweep. The stale workflow uses `GITHUB_TOKEN`, so its label
 changes cannot trigger another workflow; the daily sweep observes those changes.
+
+A pull request or issue event does not apply the policy itself. Its job
+dispatches the same workflow on the default branch, and the dispatched run labels
+the duplicates. The reason is the repository-wide concurrency group that
+serializes those runs: GitHub keeps one queued job per group and cancels it when
+a newer one arrives. The cancellation is harmless, because every run computes
+the duplicate labels for the whole repository, but a cancelled job on a pull
+request reads as a failed check. A dispatched run belongs to the default branch,
+so its cancellation is recorded on that branch's commit and in the Actions tab,
+not on a pull request. The cost is two short runs per event, and an
+`actions: write` permission on the dispatching job, which checks out no code.
 
 The action runs the script through `actions/github-script` with the repository's built-in `GITHUB_TOKEN`. The `pull_request_target` trigger runs in the base repository context, so that token carries the workflow's declared write permissions even for pull requests from forks.
 
